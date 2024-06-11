@@ -1,8 +1,8 @@
-# utils.py
 import asyncio
 import os
 import sqlite3
 import json
+import traceback
 from datetime import datetime
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
@@ -32,7 +32,7 @@ DB_SCHEMA = config['db_schema']['plugins']
 logger.add("plugin_manager.log", rotation="10 MB")
 
 def normalize_name(name):
-    return ''.join(e for e in name if e.isalnum()).lower()
+    return ''.join(e for e in name if e.isalpha()).lower()
 
 @asynccontextmanager
 async def http_session():
@@ -100,12 +100,19 @@ async def fetch(url, session, headers=None, params=None):
         logger.debug(f"Fetching URL: {url} with headers: {headers} and params: {params}")
         response = await session.get(url, headers=headers, params=params)
         response.raise_for_status()
-        return response.json()
+        json_response = response.json()
+        if isinstance(json_response, dict):
+            return json_response
+        else:
+            logger.error(f"Unexpected response format: {json_response}")
+            return None
     except HTTPStatusError as e:
         logger.error(f"HTTP error fetching {url}: {e.response.status_code} - {e.response.text}")
+        logger.error(traceback.format_exc())
         return None
     except Exception as e:
         logger.error(f"Unexpected error fetching {url}: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 async def authenticate_hangar():
@@ -194,9 +201,11 @@ def convert_hangar_to_unified(hangar_data):
     }
 
 async def search_plugin(plugin_name):
-    # Check cache (SQLite) first for both sources
-    cached_data = await get_plugin_from_db(normalize_name(plugin_name))
+    # Normalize the plugin name
+    normalized_plugin_name = normalize_name(plugin_name)
 
+    # Check cache (SQLite) first
+    cached_data = await get_plugin_from_db(normalized_plugin_name)
     if cached_data:
         logger.info(f"Found cached data for {plugin_name}")
         return [cached_data], "cache"
@@ -205,19 +214,23 @@ async def search_plugin(plugin_name):
     token = await authenticate_hangar()
     if token:
         hangar_results = await search_plugin_hangar(plugin_name, token)
-        if hangar_results and hangar_results.get('pagination', {}).get('count', 0) > 0:
-            unified_data = [convert_hangar_to_unified(plugin) for plugin in hangar_results['result']]
-            for data in unified_data:
-                await insert_or_update_plugin(data)
-            return unified_data, "hangar"
+        if hangar_results:
+            hangar_plugins = [convert_hangar_to_unified(plugin) for plugin in hangar_results.get('result', [])]
+            logger.debug(f"Hangar results: {hangar_plugins}")
+            best_match = get_best_match(normalized_plugin_name, hangar_plugins)
+            if best_match:
+                await insert_or_update_plugin(best_match)
+                return [best_match], "hangar"
 
-    # If not found in Hangar, search in Modrinth
+    # If not found in Hangar or no best match, search in Modrinth
     modrinth_results = await search_plugin_modrinth(plugin_name)
-    if modrinth_results and modrinth_results.get('total_hits', 0) > 0:
-        unified_data = [convert_modrinth_to_unified(plugin) for plugin in modrinth_results['hits']]
-        for data in unified_data:
-            await insert_or_update_plugin(data)
-        return unified_data, "modrinth"
+    if modrinth_results:
+        modrinth_plugins = [convert_modrinth_to_unified(plugin) for plugin in modrinth_results.get('hits', [])]
+        logger.debug(f"Modrinth results: {modrinth_plugins}")
+        best_match = get_best_match(normalized_plugin_name, modrinth_plugins)
+        if best_match:
+            await insert_or_update_plugin(best_match)
+            return [best_match], "modrinth"
 
     return [], None
 
@@ -245,11 +258,16 @@ def get_best_match(plugin_name, results):
     normalized_plugin_name = normalize_name(plugin_name)
 
     for plugin in results:
-        normalized_result_name = normalize_name(plugin['title'] if plugin.get('title') else plugin['name'])
-        score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
-        if score > highest_score:
-            highest_score = score
-            best_match = plugin
+        logger.debug(f"Comparing {plugin_name} with {plugin.get('name')}")
+        if isinstance(plugin, dict):
+            normalized_result_name = normalize_name(plugin['title'] if plugin.get('title') else plugin['name'])
+            score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
+            logger.debug(f"Score for {plugin.get('name')}: {score}")
+            if score > highest_score:
+                highest_score = score
+                best_match = plugin
+        else:
+            logger.error(f"Unexpected plugin type: {type(plugin)}. Expected dict, got {type(plugin)}")
 
     return best_match if highest_score > 0.8 else None
 
@@ -271,6 +289,8 @@ async def check_plugins(folder_path):
             results_with_sources = await asyncio.gather(*tasks)
 
             for (plugin_name, plugin_version), (results, source) in zip(plugins, results_with_sources):
+                logger.debug(f"Results type: {type(results)}, value: {results}")
+                logger.debug(f"Source type: {type(source)}, value: {source}")
                 best_match = get_best_match(plugin_name, results)
                 if best_match:
                     plugin_data = await get_plugin_from_db(normalize_name(plugin_name))
@@ -285,11 +305,13 @@ async def check_plugins(folder_path):
                         if not os.path.exists(image_filepath):
                             await download_image(plugin_data['icon_url'], image_filepath)
 
-                    state.add_found_plugin((plugin_name, plugin_data['date_modified'], plugin_data['title'], plugin_data['url'], plugin_data, image_filepath))
+                    state.add_found_plugin((plugin_name, plugin_data['date_modified'], plugin_data['title'],
+                                            plugin_data['url'], plugin_data, image_filepath))
                 else:
                     state.add_not_found_plugin((plugin_name, plugin_version))
     except Exception as e:
         logger.error(f"Error checking plugins: {e}")
+        logger.error(traceback.format_exc())
 
     return state.found_plugins, state.not_found_plugins
 

@@ -1,0 +1,36 @@
+{
+  "api_keys": {
+    "modrinth": "MODAPI",
+    "hangar": "HANGERAPI"
+  },
+  "urls": {
+    "search_modrinth": "https://api.modrinth.com/v2/search",
+    "project_modrinth": "https://api.modrinth.com/v2/project",
+    "version_modrinth": "https://api.modrinth.com/v2/version",
+    "auth_hangar": "https://hangar.papermc.io/api/v1/authenticate",
+    "search_hangar": "https://hangar.papermc.io/api/v1/projects"
+  },
+  "paths": {
+    "cache_dir": "cache",
+    "plugin_folder": "C:\\Custom\\ProgrammingProjects\\plugins",
+    "db_path": "cache/plugins.db"
+  },
+  "user_agent": "PluginManagerApp/1.0",
+  "db_schema": {
+    "plugins": {
+      "id": "INTEGER PRIMARY KEY",
+      "name": "TEXT",
+      "title": "TEXT",
+      "description": "TEXT",
+      "author": "TEXT",
+      "date_created": "TEXT",
+      "date_modified": "TEXT",
+      "icon_url": "TEXT",
+      "category": "TEXT",
+      "downloads": "INTEGER",
+      "follows": "INTEGER",
+      "url": "TEXT",
+      "source": "TEXT"
+    }
+  }
+}
