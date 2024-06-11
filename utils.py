@@ -31,8 +31,10 @@ DB_SCHEMA = config['db_schema']['plugins']
 
 logger.add("plugin_manager.log", rotation="10 MB")
 
+
 def normalize_name(name):
     return ''.join(e for e in name if e.isalpha()).lower()
+
 
 @asynccontextmanager
 async def http_session():
@@ -41,6 +43,7 @@ async def http_session():
             yield session
         finally:
             await session.aclose()
+
 
 def init_db():
     if not os.path.exists(CACHE_DIR):
@@ -52,6 +55,7 @@ def init_db():
                       )''')
     conn.commit()
     conn.close()
+
 
 async def insert_or_update_plugin(plugin_data):
     try:
@@ -67,6 +71,7 @@ async def insert_or_update_plugin(plugin_data):
         conn.close()
     except Exception as e:
         logger.error(f"Error inserting or updating plugin data: {e}")
+
 
 async def get_plugin_from_db(plugin_name):
     try:
@@ -95,6 +100,7 @@ async def get_plugin_from_db(plugin_name):
         logger.error(f"Error fetching plugin from database: {e}")
         return None
 
+
 async def fetch(url, session, headers=None, params=None):
     try:
         logger.debug(f"Fetching URL: {url} with headers: {headers} and params: {params}")
@@ -115,6 +121,7 @@ async def fetch(url, session, headers=None, params=None):
         logger.error(traceback.format_exc())
         return None
 
+
 async def authenticate_hangar():
     try:
         async with http_session() as session:
@@ -130,127 +137,87 @@ async def authenticate_hangar():
         logger.error(f"Unexpected error during Hangar authentication: {e}")
         return None
 
-async def search_plugin_modrinth(plugin_name):
-    try:
-        async with http_session() as session:
-            headers = {
+
+async def search_plugin(plugin_name, source="both"):
+    async with http_session() as session:
+        normalized_plugin_name = normalize_name(plugin_name)
+
+        # Check cache (SQLite) first
+        cached_data = await get_plugin_from_db(normalized_plugin_name)
+        if cached_data:
+            logger.info(f"Found cached data for {plugin_name}")
+            return [cached_data], "cache"
+
+        # Search in Hangar
+        if source in ("hangar", "both"):
+            token = await authenticate_hangar()
+            if token:
+                hangar_results = await fetch(SEARCH_URL_HANGAR, session, headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": USER_AGENT
+                }, params={"q": normalized_plugin_name, "limit": 10})
+                if hangar_results:
+                    hangar_plugins = [convert_to_unified(plugin, "hangar") for plugin in
+                                      hangar_results.get('result', [])]
+                    best_match = get_best_match(normalized_plugin_name, hangar_plugins)
+                    if best_match:
+                        await insert_or_update_plugin(best_match)
+                        return [best_match], "hangar"
+
+        # If not found in Hangar or no best match, search in Modrinth
+        if source in ("modrinth", "both"):
+            modrinth_results = await fetch(SEARCH_URL_MODRINTH, session, headers={
                 "Authorization": f"Bearer {API_KEY_MODRINTH}",
                 "User-Agent": USER_AGENT
-            }
-            params = {
+            }, params={
                 "query": plugin_name,
                 "limit": 10,
                 "facets": "[[\"categories:utility\"]]",
                 "sort": "popularity"
-            }
-            return await fetch(SEARCH_URL_MODRINTH, session, headers=headers, params=params)
-    except Exception as e:
-        logger.error(f"Error searching Modrinth plugin: {e}")
-        return None
-
-async def search_plugin_hangar(plugin_name, token):
-    try:
-        normalized_plugin_name = ''.join(e for e in plugin_name if e.isalpha())
-
-        logger.info(f"Searching for plugin '{normalized_plugin_name}' in Hangar")
-
-        async with http_session() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "User-Agent": USER_AGENT
-            }
-            params = {
-                "q": normalized_plugin_name,
-                "limit": 10
-            }
-            return await fetch(SEARCH_URL_HANGAR, session, headers=headers, params=params)
-    except Exception as e:
-        logger.error(f"Error searching Hangar plugin: {e}")
-        return None
-
-def convert_modrinth_to_unified(modrinth_data):
-    return {
-        "name": normalize_name(modrinth_data.get("title", "")),
-        "title": modrinth_data.get("title", ""),
-        "description": modrinth_data.get("description", ""),
-        "author": modrinth_data.get("author", "Unknown Author"),
-        "date_created": modrinth_data.get("date_created", ""),
-        "date_modified": modrinth_data.get("date_modified", ""),
-        "icon_url": modrinth_data.get("icon_url", ""),
-        "category": modrinth_data.get("categories", [""])[0],
-        "downloads": modrinth_data.get("downloads", 0),
-        "follows": modrinth_data.get("follows", 0),
-        "url": f"https://modrinth.com/mod/{modrinth_data.get('slug', '')}",
-        "source": "modrinth"
-    }
-
-def convert_hangar_to_unified(hangar_data):
-    return {
-        "name": normalize_name(hangar_data.get("name", "")),
-        "title": hangar_data.get("name", ""),
-        "description": hangar_data.get("description", ""),
-        "author": hangar_data.get("namespace", {}).get("owner", "Unknown Author"),
-        "date_created": hangar_data.get("createdAt", ""),
-        "date_modified": hangar_data.get("lastUpdated", ""),
-        "icon_url": hangar_data.get("avatarUrl", ""),
-        "category": hangar_data.get("category", ""),
-        "downloads": hangar_data.get("stats", {}).get("downloads", 0),
-        "follows": hangar_data.get("stats", {}).get("stars", 0),
-        "url": f"https://hangar.papermc.io/{hangar_data.get('namespace', {}).get('owner', '')}/{hangar_data.get('namespace', {}).get('slug', '')}",
-        "source": "hangar"
-    }
-
-async def search_plugin(plugin_name):
-    # Normalize the plugin name
-    normalized_plugin_name = normalize_name(plugin_name)
-
-    # Check cache (SQLite) first
-    cached_data = await get_plugin_from_db(normalized_plugin_name)
-    if cached_data:
-        logger.info(f"Found cached data for {plugin_name}")
-        return [cached_data], "cache"
-
-    # If not in cache, search in Hangar first
-    token = await authenticate_hangar()
-    if token:
-        hangar_results = await search_plugin_hangar(plugin_name, token)
-        if hangar_results:
-            hangar_plugins = [convert_hangar_to_unified(plugin) for plugin in hangar_results.get('result', [])]
-            logger.debug(f"Hangar results: {hangar_plugins}")
-            best_match = get_best_match(normalized_plugin_name, hangar_plugins)
-            if best_match:
-                await insert_or_update_plugin(best_match)
-                return [best_match], "hangar"
-
-    # If not found in Hangar or no best match, search in Modrinth
-    modrinth_results = await search_plugin_modrinth(plugin_name)
-    if modrinth_results:
-        modrinth_plugins = [convert_modrinth_to_unified(plugin) for plugin in modrinth_results.get('hits', [])]
-        logger.debug(f"Modrinth results: {modrinth_plugins}")
-        best_match = get_best_match(normalized_plugin_name, modrinth_plugins)
-        if best_match:
-            await insert_or_update_plugin(best_match)
-            return [best_match], "modrinth"
+            })
+            if modrinth_results:
+                modrinth_plugins = [convert_to_unified(plugin, "modrinth") for plugin in
+                                    modrinth_results.get('hits', [])]
+                best_match = get_best_match(normalized_plugin_name, modrinth_plugins)
+                if best_match:
+                    await insert_or_update_plugin(best_match)
+                    return [best_match], "modrinth"
 
     return [], None
 
-async def fetch_version_details(version_id, session):
-    headers = {
-        "Authorization": f"Bearer {API_KEY_MODRINTH}",
-        "User-Agent": USER_AGENT
-    }
-    return await fetch(f"{config['urls']['version_modrinth']}/{version_id}", session, headers=headers)
 
-async def download_image(url, filepath):
-    try:
-        async with http_session() as session:
-            async with session.stream("GET", url) as response:
-                response.raise_for_status()
-                with open(filepath, 'wb') as f:
-                    async for chunk in response.aiter_bytes():
-                        f.write(chunk)
-    except Exception as e:
-        logger.error(f"Error downloading image: {e}")
+def convert_to_unified(data, source):
+    if source == "modrinth":
+        return {
+            "name": normalize_name(data.get("title", "")),
+            "title": data.get("title", ""),
+            "description": data.get("description", ""),
+            "author": data.get("author", "Unknown Author"),
+            "date_created": data.get("date_created", ""),
+            "date_modified": data.get("date_modified", ""),
+            "icon_url": data.get("icon_url", ""),
+            "category": data.get("categories", [""])[0],
+            "downloads": data.get("downloads", 0),
+            "follows": data.get("follows", 0),
+            "url": f"https://modrinth.com/mod/{data.get('slug', '')}",
+            "source": source
+        }
+    elif source == "hangar":
+        return {
+            "name": normalize_name(data.get("name", "")),
+            "title": data.get("name", ""),
+            "description": data.get("description", ""),
+            "author": data.get("namespace", {}).get("owner", "Unknown Author"),
+            "date_created": data.get("createdAt", ""),
+            "date_modified": data.get("lastUpdated", ""),
+            "icon_url": data.get("avatarUrl", ""),
+            "category": data.get("category", ""),
+            "downloads": data.get("stats", {}).get("downloads", 0),
+            "follows": data.get("stats", {}).get("stars", 0),
+            "url": f"https://hangar.papermc.io/{data.get('namespace', {}).get('owner', '')}/{data.get('namespace', {}).get('slug', '')}",
+            "source": source
+        }
+
 
 def get_best_match(plugin_name, results):
     best_match = None
@@ -258,26 +225,19 @@ def get_best_match(plugin_name, results):
     normalized_plugin_name = normalize_name(plugin_name)
 
     for plugin in results:
-        logger.debug(f"Comparing {plugin_name} with {plugin.get('name')}")
-        if isinstance(plugin, dict):
-            normalized_result_name = normalize_name(plugin['title'] if plugin.get('title') else plugin['name'])
-            score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
-            logger.debug(f"Score for {plugin.get('name')}: {score}")
-            if score > highest_score:
-                highest_score = score
-                best_match = plugin
-        else:
-            logger.error(f"Unexpected plugin type: {type(plugin)}. Expected dict, got {type(plugin)}")
+        normalized_result_name = normalize_name(plugin['title'] if plugin.get('title') else plugin['name'])
+        score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
+        if score > highest_score:
+            highest_score = score
+            best_match = plugin
 
     return best_match if highest_score > 0.8 else None
 
+
 def scan_folder(folder_path):
-    plugins = []
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".jar"):
-            plugin_name = os.path.splitext(filename)[0]
-            plugins.append((plugin_name, "Unknown Version"))
-    return plugins
+    return [(os.path.splitext(filename)[0], "Unknown Version") for filename in os.listdir(folder_path) if
+            filename.endswith(".jar")]
+
 
 async def check_plugins(folder_path):
     plugins = scan_folder(folder_path)
@@ -289,8 +249,6 @@ async def check_plugins(folder_path):
             results_with_sources = await asyncio.gather(*tasks)
 
             for (plugin_name, plugin_version), (results, source) in zip(plugins, results_with_sources):
-                logger.debug(f"Results type: {type(results)}, value: {results}")
-                logger.debug(f"Source type: {type(source)}, value: {source}")
                 best_match = get_best_match(plugin_name, results)
                 if best_match:
                     plugin_data = await get_plugin_from_db(normalize_name(plugin_name))
@@ -315,6 +273,19 @@ async def check_plugins(folder_path):
 
     return state.found_plugins, state.not_found_plugins
 
+
+async def download_image(url, filepath):
+    try:
+        async with http_session() as session:
+            async with session.stream("GET", url) as response:
+                response.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    async for chunk in response.aiter_bytes():
+                        f.write(chunk)
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+
+
 async def check_for_updates(found_plugins):
     updates = []
     try:
@@ -329,6 +300,7 @@ async def check_for_updates(found_plugins):
         logger.error(f"Error checking updates: {e}")
         return updates
 
+
 async def download_plugin(url, destination):
     try:
         async with http_session() as session:
@@ -340,12 +312,14 @@ async def download_plugin(url, destination):
     except Exception as e:
         logger.error(f"Error downloading plugin: {e}")
 
+
 def prettify_date(date_str):
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         return dt.strftime("%B %d, %Y")
     except ValueError:
         return date_str
+
 
 async def load_plugins():
     state.set_loading(True)
