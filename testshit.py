@@ -2,17 +2,22 @@ import asyncio
 import json
 import os
 import logging
+import sys
 from difflib import SequenceMatcher
-from urllib.request import urlretrieve
-
-import aiohttp
-import flet as ft
-from aiohttp.client_exceptions import ClientError
-import ctypes
+from contextlib import asynccontextmanager
+import httpx
+from httpx import HTTPStatusError
+from cachetools import TTLCache
+import colorlog
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QPushButton, QLabel, QWidget, QListWidget, QListWidgetItem, QHBoxLayout, QTextEdit
+from PySide6.QtGui import QPixmap
+import qt_material
+from datetime import datetime
 
 # Configuration
-API_KEY_MODRINTH = "mrp_OAGlIyM8TsArB075q7P9kMxMyFaqJEOqC00PcVWNG2CSZoWe3mhXylH0p4xt"
-API_KEY_HANGAR = "f1eb3a00-8f95-43b7-bbde-1b4953aeae40.f09efd5c-a3a4-4f2b-991d-ed36e58d7bb5".strip()  # New Hangar API key
+API_KEY_MODRINTH = os.environ.get('MODAPI')
+API_KEY_HANGAR = os.environ.get('HANGERAPI')
 SEARCH_URL_MODRINTH = "https://api.modrinth.com/v2/search"
 PROJECT_URL_MODRINTH = "https://api.modrinth.com/v2/project"
 VERSION_URL_MODRINTH = "https://api.modrinth.com/v2/version"
@@ -22,12 +27,13 @@ CACHE_DIR = "cache"
 PLUGIN_FOLDER = "C:\\Custom\\Sandal Wearers\\plugins"
 USER_AGENT = "PluginManagerApp/1.0"
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Create cache directory if it doesn't exist
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+# Set up logging with colors using colorlog
+log_format = "%(log_color)s%(asctime)s - %(levelname)s - %(message)s"
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(log_format))
+logger = colorlog.getLogger()
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
 class State:
@@ -95,60 +101,66 @@ def normalize_name(name):
     return ''.join(e for e in name if e.isalnum()).lower()
 
 
+cache = TTLCache(maxsize=100, ttl=3600)
+
+
 def cache_plugin_data(plugin_name, data, source):
-    with open(os.path.join(CACHE_DIR, f"{source}_{plugin_name}.json"), "w") as f:
+    cache_key = f"{source}_{plugin_name}"
+    cache[cache_key] = data
+    cache_filepath = os.path.join(CACHE_DIR, cache_key + '.json')
+    with open(cache_filepath, 'w') as f:
         json.dump(data, f)
 
 
 def load_cached_plugin_data(plugin_name, source):
-    cache_path = os.path.join(CACHE_DIR, f"{source}_{plugin_name}.json")
-    if os.path.exists(cache_path):
-        with open(cache_path, "r") as f:
-            return json.load(f)
+    cache_key = f"{source}_{plugin_name}"
+    cache_filepath = os.path.join(CACHE_DIR, cache_key + '.json')
+    if cache_key in cache:
+        return cache[cache_key]
+    elif os.path.exists(cache_filepath):
+        with open(cache_filepath, 'r') as f:
+            data = json.load(f)
+            cache[cache_key] = data
+            return data
     return None
 
 
-def cache_image(url, plugin_name, source):
-    if not url:
-        return None
-    image_path = os.path.join(CACHE_DIR, f"{source}_{plugin_name}.png")
-    if not os.path.exists(image_path):
-        urlretrieve(url, image_path)
-    return image_path
+@asynccontextmanager
+async def http_session():
+    async with httpx.AsyncClient() as session:
+        yield session
 
 
 async def fetch(url, session, headers=None, params=None):
     try:
-        async with session.get(url, headers=headers, params=params) as response:
-            if response.status != 200:
-                error_message = await response.text()
-                logging.error(f"Error fetching {url}: {response.status} - {error_message}")
-                return None
-            return await response.json()
-    except ClientError as e:
-        logging.error(f"Client error fetching {url}: {e}")
+        logger.debug(f"Fetching URL: {url} with headers: {headers} and params: {params}")
+        response = await session.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except HTTPStatusError as e:
+        logger.error(f"HTTP error fetching {url}: {e.response.status_code} - {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error fetching {url}: {e}")
         return None
 
 
 async def authenticate_hangar():
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         headers = {"User-Agent": USER_AGENT}
         api_key = state.get_api_key("hangar")
-        async with session.post(f"{AUTH_URL_HANGAR}?apiKey={api_key}", headers=headers) as response:
-            if response.status != 200:
-                error_message = await response.text()
-                logging.error(f"Error authenticating with Hangar API: {response.status} - {error_message}")
-                return None
-            data = await response.json()
-            if "token" in data:
-                return data["token"]
-            else:
-                logging.error("Failed to authenticate with Hangar API")
-                return None
+        try:
+            response = await session.post(f"{AUTH_URL_HANGAR}?apiKey={api_key}", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("token")
+        except HTTPStatusError as e:
+            logger.error(f"Error authenticating with Hangar API: {e.response.status_code} - {e.response.text}")
+            return None
 
 
 async def search_plugin_modrinth(plugin_name):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         headers = {
             "Authorization": f"Bearer {API_KEY_MODRINTH}",
             "User-Agent": USER_AGENT
@@ -163,7 +175,7 @@ async def search_plugin_modrinth(plugin_name):
 
 
 async def search_plugin_hangar(plugin_name, token):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         headers = {
             "Authorization": f"Bearer {token}",
             "User-Agent": USER_AGENT
@@ -177,14 +189,14 @@ async def search_plugin_hangar(plugin_name, token):
 
 async def search_plugin(plugin_name):
     modrinth_results = await search_plugin_modrinth(plugin_name)
-    logging.info(f"Modrinth results: {modrinth_results}")
+    logger.info(f"Modrinth results: {modrinth_results}")
     if modrinth_results and modrinth_results.get('total_hits', 0) > 0:
         return modrinth_results['hits'], "modrinth"
 
     token = await authenticate_hangar()
     if token:
         hangar_results = await search_plugin_hangar(plugin_name, token)
-        logging.info(f"Hangar results: {hangar_results}")
+        logger.info(f"Hangar results: {hangar_results}")
         if hangar_results and hangar_results.get('pagination', {}).get('count', 0) > 0:
             return hangar_results['result'], "hangar"
     return [], None
@@ -198,6 +210,15 @@ async def fetch_version_details(version_id, session):
     return await fetch(f"{VERSION_URL_MODRINTH}/{version_id}", session, headers=headers)
 
 
+async def download_image(url, filepath):
+    async with http_session() as session:
+        async with session.stream("GET", url) as response:
+            response.raise_for_status()
+            with open(filepath, 'wb') as f:
+                async for chunk in response.aiter_bytes():
+                    f.write(chunk)
+
+
 def get_best_match(plugin_name, results, source):
     best_match = None
     highest_score = 0
@@ -205,14 +226,8 @@ def get_best_match(plugin_name, results, source):
 
     for plugin in results:
         if source == "modrinth":
-            if 'title' not in plugin:
-                logging.error(f"Plugin data does not contain 'title' key: {plugin}")
-                continue
             normalized_result_name = normalize_name(plugin['title'])
         elif source == "hangar":
-            if 'name' not in plugin:
-                logging.error(f"Plugin data does not contain 'name' key: {plugin}")
-                continue
             normalized_result_name = normalize_name(plugin['name'])
 
         score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
@@ -220,10 +235,7 @@ def get_best_match(plugin_name, results, source):
             highest_score = score
             best_match = plugin
 
-    if best_match and highest_score > 0.8:
-        return best_match
-    else:
-        return None
+    return best_match if highest_score > 0.8 else None
 
 
 def scan_folder(folder_path):
@@ -239,12 +251,8 @@ async def check_plugins(folder_path):
     plugins = scan_folder(folder_path)
     state.clear_plugins()
 
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        sources = []
-        for plugin_name, plugin_version in plugins:
-            tasks.append(search_plugin(plugin_name))
-
+    async with http_session() as session:
+        tasks = [search_plugin(plugin_name) for plugin_name, _ in plugins]
         results_with_sources = await asyncio.gather(*tasks)
 
         for (plugin_name, plugin_version), (result, source) in zip(plugins, results_with_sources):
@@ -255,30 +263,35 @@ async def check_plugins(folder_path):
                     plugin_data = best_match
                     cache_plugin_data(plugin_name, plugin_data, source)
 
-                # Avoid fetching version details if they are already cached
                 if source == "modrinth":
-                    if 'versions' in plugin_data and all(isinstance(v, str) for v in plugin_data['versions']):
+                    if 'versions' in plugin_data:
                         valid_versions = plugin_data['versions']
                     else:
-                        # Fetch the version details for each version if not cached
                         version_details_tasks = [fetch_version_details(version_id, session) for version_id in
                                                  plugin_data['versions']]
                         version_details = await asyncio.gather(*version_details_tasks)
                         valid_versions = [v['version_number'] for v in version_details if v and 'version_number' in v]
 
-                        # Update the cached plugin data with fetched version details
                         plugin_data['versions'] = valid_versions
                         cache_plugin_data(plugin_name, plugin_data, source)
-                    latest_version = plugin_data['latest_version'] if 'latest_version' in plugin_data else \
-                    valid_versions[-1] if valid_versions else "Unknown Version"
+                    date_modified = plugin_data['date_modified'] if 'date_modified' in plugin_data else "Unknown Date"
+                    icon_url = plugin_data.get('icon_url', None)
                 else:
-                    # For Hangar, handle versions differently if needed
-                    latest_version = best_match.get('lastUpdated', "Unknown Version")
+                    date_modified = best_match.get('lastUpdated', "Unknown Date")
+                    icon_url = best_match.get('avatarUrl', None)
 
-                state.add_found_plugin((plugin_name, latest_version,
+                if icon_url:
+                    file_ext = os.path.splitext(icon_url)[-1].split('?')[0]
+                    image_filepath = os.path.join(CACHE_DIR, f"{plugin_name}{file_ext}")
+                    if not os.path.exists(image_filepath):
+                        await download_image(icon_url, image_filepath)
+                else:
+                    image_filepath = None
+
+                state.add_found_plugin((plugin_name, date_modified,
                                         plugin_data['title'] if source == "modrinth" else plugin_data['name'],
                                         plugin_data['project_id'] if source == "modrinth" else plugin_data['namespace'][
-                                            'slug'], plugin_data), source)
+                                            'slug'], plugin_data, image_filepath), source)
             else:
                 state.add_not_found_plugin((plugin_name, plugin_version))
 
@@ -291,37 +304,32 @@ async def fetch_versions(project_id):
         "Authorization": f"Bearer {API_KEY_MODRINTH}",
         "User-Agent": USER_AGENT
     }
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         return await fetch(url, session, headers=headers)
 
 
 async def download_plugin(version_id, destination):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         headers = {
             "Authorization": f"Bearer {API_KEY_MODRINTH}",
             "User-Agent": USER_AGENT
         }
         data = await fetch(f"{VERSION_URL_MODRINTH}/{version_id}", session, headers=headers)
         if not data or 'files' not in data or not data['files']:
-            logging.error(f"Error fetching version data for {version_id}")
+            logger.error(f"Error fetching version data for {version_id}")
             return
 
         download_url = data['files'][0]['url']
-        async with session.get(download_url) as download_response:
-            if download_response.status != 200:
-                logging.error(f"Error downloading {download_url}: {download_response.status}")
-                return
+        async with session.stream("GET", download_url) as download_response:
+            download_response.raise_for_status()
             with open(destination, 'wb') as f:
-                while True:
-                    chunk = await download_response.content.read(1024)
-                    if not chunk:
-                        break
+                async for chunk in download_response.aiter_bytes():
                     f.write(chunk)
 
 
 async def check_for_updates(found_plugins):
     updates = []
-    for (plugin_name, current_version, mod_name, project_id, plugin_data), source in found_plugins:
+    for (plugin_name, current_version, mod_name, project_id, plugin_data, _), source in found_plugins:
         if source == "modrinth":
             if 'versions' not in plugin_data or not plugin_data['versions']:
                 continue
@@ -338,200 +346,181 @@ async def check_for_updates(found_plugins):
                     latest_version = version
 
             if current_version_date and latest_version_date > current_version_date:
-                updates.append((plugin_name, current_version, latest_version))
+                updates.append((plugin_name, current_version, latest_version['version_number'], latest_version_date))
         else:
-            # For Hangar, handle updates differently if needed
-            latest_version = plugin_data.get('lastUpdated', "Unknown Version")
+            latest_version = plugin_data.get('lastUpdated', "Unknown Date")
             if latest_version != current_version:
-                updates.append((plugin_name, current_version, latest_version))
+                updates.append((plugin_name, current_version, latest_version, latest_version))
 
     return updates
 
 
-async def load_plugins(page):
+async def load_plugins():
     state.set_loading(True)
-    page.update()
-
-    state.clear_plugins()
     found_plugins, not_found_plugins = await check_plugins(state.get_plugin_folder())
-
-    plugin_list = ft.ListView(expand=True, spacing=10, padding=10)
-    for (plugin_name, plugin_version, mod_name, mod_id, plugin_data), source in found_plugins:
-        categories = ', '.join(plugin_data.get('categories', [])) if 'categories' in plugin_data else ""
-        image_path = cache_image(plugin_data.get('icon_url', plugin_data.get('avatarUrl')), plugin_name, source)
-        if image_path:
-            plugin_image = ft.Image(src=image_path, width=48, height=48)
-        else:
-            plugin_image = None
-        plugin_info = ft.Column(
-            controls=[
-                ft.Text(f"Name: {plugin_name}", size=20, weight="bold"),
-                ft.Text(f"Version: {plugin_version}"),
-                ft.Text(f"Found Mod: {mod_name}"),
-                ft.Text(f"Categories: {categories}"),
-            ],
-            alignment="start",
-            spacing=5
-        )
-        plugin_container = ft.Container(
-            content=ft.ListTile(
-                title=ft.Text(plugin_name),
-                subtitle=ft.Text(f"Version: {plugin_version}"),
-                leading=plugin_image,
-                trailing=ft.ElevatedButton(text="Update", on_click=lambda e, p=plugin_data: update_plugin(p)),
-                on_click=lambda e, p=plugin_data: select_plugin(p, page),
-            ),
-            border=ft.border.all(1, "white") if state.get_selected_plugin() == plugin_data else None,
-            padding=5
-        )
-        plugin_list.controls.append(plugin_container)
-
-    for plugin_name, plugin_version in not_found_plugins:
-        plugin_list.controls.append(
-            ft.Container(
-                ft.Row(
-                    controls=[
-                        ft.Text(f"Name: {plugin_name}", color="red"),
-                        ft.Text(f"Version: {plugin_version}", color="red"),
-                        ft.Text("Not Found", color="red"),
-                    ],
-                    alignment="start"
-                ),
-                padding=10
-            )
-        )
-
     state.set_loading(False)
-    page.controls.append(plugin_list)
-    page.update()
+    return found_plugins, not_found_plugins
 
 
 def update_plugin(plugin):
-    logging.info(f"Updating plugin: {plugin.get('title', plugin.get('name'))}")
+    logger.info(f"Updating plugin: {plugin.get('title', plugin.get('name'))}")
+    asyncio.create_task(download_plugin(plugin['versions'][0], f"{state.get_plugin_folder()}/{plugin['title']}.jar"))
 
 
-def select_plugin(plugin, page):
-    state.set_selected_plugin(plugin)
-    logging.info(f"Selected plugin: {plugin.get('title', plugin.get('name'))}")
-    rebuild_info_box(page)
+def create_plugin_list_item(plugin, source):
+    widget = QWidget()
+    layout = QHBoxLayout()
 
+    label_name = QLabel(f"<a href='https://modrinth.com/plugin/{plugin[3]}' style='color: white'>{plugin[2]}</a>")
+    label_name.setOpenExternalLinks(True)
+    label_last_updated = QLabel(f"Date Modified: {prettify_date(plugin[1])}")
 
-async def check_updates(page):
-    state.set_loading(True)
-    page.update()
-
-    updates = await check_for_updates(state.found_plugins)
-    plugin_list = ft.ListView(expand=True, spacing=10, padding=10)
-    if updates:
-        state.set_update_status(updates)
-        for name, current_version, latest_version in updates:
-            plugin_list.controls.append(
-                ft.Text(f"Update available for {name}: {current_version} -> {latest_version}", color="green")
-            )
+    image_label = QLabel()
+    image_filepath = plugin[5]
+    if image_filepath and os.path.exists(image_filepath):
+        pixmap = QPixmap(image_filepath)
+        image_label.setPixmap(pixmap)
+        image_label.setFixedSize(64, 64)
+        image_label.setScaledContents(True)
     else:
-        plugin_list.controls.append(
-            ft.Text("All plugins are up to date.", color="green")
-        )
+        image_label.setText("No Image")
 
-    state.set_loading(False)
-    page.controls.append(plugin_list)
-    page.update()
+    layout.addWidget(image_label)
+    layout.addWidget(label_name)
+    layout.addWidget(label_last_updated)
+    widget.setLayout(layout)
 
-
-def build_info_box():
-    plugin = state.get_selected_plugin()
-    if plugin:
-        return ft.Column(
-            controls=[
-                ft.Text(f"Name: {plugin.get('title', plugin.get('name'))}", size=24, weight="bold",
-                        url=f"https://modrinth.com/plugin/{plugin.get('project_id', plugin.get('namespace', {}).get('slug'))}"),
-                ft.Text(f"Author: {plugin.get('author')}"),
-                ft.Text(f"Description: {plugin.get('description')}"),
-            ],
-            alignment="start",
-            spacing=5,
-            expand=True,
-            padding=10
-        )
-    else:
-        return ft.Container()
+    return widget
 
 
-def rebuild_info_box(page):
-    info_box = build_info_box()
-    for control in page.controls:
-        if isinstance(control, ft.Container) and control.expand:
-            control.content = info_box
-            page.update()
+def create_not_found_plugin_list_item(plugin_name, plugin_version):
+    widget = QWidget()
+    layout = QHBoxLayout()
+
+    label_name = QLabel(f"Name: {plugin_name}")
+    label_version = QLabel(f"Version: {plugin_version}")
+    label_not_found = QLabel("Not Found")
+
+    layout.addWidget(label_name)
+    layout.addWidget(label_version)
+    layout.addWidget(label_not_found)
+    widget.setLayout(layout)
+
+    return widget
 
 
-def main(page: ft.Page):
-    # Set process name for task manager
-    ctypes.windll.kernel32.SetConsoleTitleW("PaperManager")
+def prettify_date(date_str):
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y")
+    except ValueError:
+        return date_str
 
-    page.title = "Plugin Manager"
-    page.theme_mode = "dark"
 
-    # Define UI components
-    plugin_list = ft.ListView(expand=True, padding=10)
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Paper Server Manager")
+        self.setMinimumSize(800, 600)
 
-    update_button = ft.ElevatedButton(text="Check for Updates", on_click=lambda e: asyncio.run(check_updates(page)))
-    remove_button = ft.ElevatedButton(text="Remove Plugins", on_click=lambda e: logging.info("Remove Plugins clicked"))
-    search_button = ft.ElevatedButton(text="Search Plugins", on_click=lambda e: logging.info("Search Plugins clicked"))
+        self.central_widget = QWidget()
+        self.layout = QVBoxLayout(self.central_widget)
 
-    button_column = ft.Container(
-        content=ft.Column(
-            controls=[update_button, remove_button, search_button],
-            alignment=ft.MainAxisAlignment.START,
-            spacing=10,
-            width=150
-        ),
-        padding=10
-    )
+        self.plugin_list = QListWidget()
+        self.plugin_list.itemClicked.connect(self.display_plugin_info)
 
-    top_box = ft.Container(
-        content=plugin_list,
-        expand=True,
-        padding=10,
-        border=ft.border.all(1, "white")
-    )
+        self.check_updates_button = QPushButton("Check for Updates")
+        self.check_updates_button.clicked.connect(self.check_updates)
 
-    info_box = ft.Container(
-        content=build_info_box(),
-        expand=True,
-        padding=10,
-        border=ft.border.all(1, "white")
-    )
+        self.remove_plugin_button = QPushButton("Remove Plugin")
+        self.remove_plugin_button.clicked.connect(self.remove_plugin)
 
-    main_layout = ft.Column(
-        controls=[
-            ft.Row(
-                controls=[
-                    top_box,
-                    button_column,
-                ],
-                expand=True,
-                spacing=10,
-                alignment=ft.MainAxisAlignment.START,
-            ),
-            ft.Container(
-                content=info_box,
-                expand=True,
-                padding=10,
-                alignment=ft.alignment.bottom_center,
-                border=ft.border.all(1, "white")
+        self.search_plugins_button = QPushButton("Search Plugins")
+        self.search_plugins_button.clicked.connect(self.search_plugins)
+
+        self.info_box = QTextEdit()
+        self.info_box.setReadOnly(True)
+
+        self.button_layout = QVBoxLayout()
+        self.button_layout.addWidget(self.check_updates_button)
+        self.button_layout.addWidget(self.remove_plugin_button)
+        self.button_layout.addWidget(self.search_plugins_button)
+
+        self.main_layout = QHBoxLayout()
+        self.main_layout.addWidget(self.plugin_list)
+        self.main_layout.addLayout(self.button_layout)
+
+        self.layout.addLayout(self.main_layout)
+        self.layout.addWidget(self.info_box)
+
+        self.setCentralWidget(self.central_widget)
+
+        asyncio.run(self.load_plugins())
+
+    async def load_plugins(self):
+        found_plugins, not_found_plugins = await load_plugins()
+        self.plugin_list.clear()
+        for plugin, source in found_plugins:
+            item = QListWidgetItem(self.plugin_list)
+            widget = create_plugin_list_item(plugin, source)
+            item.setSizeHint(widget.sizeHint())
+            item.setData(Qt.UserRole, plugin)
+            self.plugin_list.setItemWidget(item, widget)
+
+        for plugin_name, plugin_version in not_found_plugins:
+            item = QListWidgetItem(self.plugin_list)
+            widget = create_not_found_plugin_list_item(plugin_name, plugin_version)
+            item.setSizeHint(widget.sizeHint())
+            self.plugin_list.setItemWidget(item, widget)
+
+    def display_plugin_info(self, item):
+        plugin = item.data(Qt.UserRole)
+        if plugin:
+            plugin_name, date_modified, mod_name, project_id, plugin_data, image_filepath = plugin
+            author = plugin_data.get('author', 'Unknown Author')
+            description = plugin_data.get('description', 'No description available.')
+
+            info_text = (
+                f"<div style='color: white; display: flex; align-items: flex-start;'>"
+                f"<img src='{image_filepath}' width='128' style='margin-right: 20px;'>"
+                f"<div>"
+                f"<h1><a href='https://modrinth.com/plugin/{project_id}' style='color: white'>{plugin_name}</a></h1>"
+                f"<p><strong>Mod Name:</strong> {mod_name}</p>"
+                f"<p><strong>Date Modified:</strong> {prettify_date(date_modified)}</p>"
+                f"<p><strong>Author:</strong> {author}</p>"
+                f"<p><strong>Description:</strong> {description}</p>"
+                f"</div>"
+                f"</div>"
             )
-        ],
-        expand=True,
-        alignment=ft.MainAxisAlignment.START
-    )
 
-    # Add components to the page
-    page.add(main_layout)
+            self.info_box.setHtml(info_text)
 
-    # Load plugins
-    asyncio.run(load_plugins(page))
+    def check_updates(self):
+        async def check():
+            updates = await check_for_updates(state.found_plugins)
+            for plugin_name, current_version, latest_version, latest_version_date in updates:
+                item = QListWidgetItem(f"Update available for {plugin_name}: {current_version} -> {latest_version} ({prettify_date(latest_version_date)})")
+                self.plugin_list.addItem(item)
 
+        asyncio.run(check())
+
+    def remove_plugin(self):
+        # Implement plugin removal logic
+        pass
+
+    def search_plugins(self):
+        # Implement plugin search logic
+        pass
+
+
+def main():
+    app = QApplication(sys.argv)
+    qt_material.apply_stylesheet(app, theme='dark_teal.xml')
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    main()
