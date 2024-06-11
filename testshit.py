@@ -7,12 +7,13 @@ from contextlib import asynccontextmanager
 from loguru import logger
 import httpx
 from httpx import HTTPStatusError
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QPushButton, QLabel, QWidget, QListWidget, \
     QListWidgetItem, QHBoxLayout, QScrollArea, QLineEdit, QMessageBox
 from PySide6.QtGui import QPixmap
 import qt_material
 from datetime import datetime
+from qasync import QEventLoop, asyncSlot, QApplication as QAsyncApplication
 
 # Configuration
 API_KEY_MODRINTH = os.environ.get('MODAPI')
@@ -480,21 +481,6 @@ def prettify_date(date_str):
         return date_str
 
 
-class AsyncWorker(QThread):
-    finished = Signal(object)
-
-    def __init__(self, coro):
-        super().__init__()
-        self.coro = coro
-
-    def run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(self.coro)
-        loop.close()
-        self.finished.emit(result)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -534,33 +520,37 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         # Run the plugin loading in the background to ensure GUI loads immediately
-        self.worker = AsyncWorker(self.load_plugins())
-        self.worker.finished.connect(self.on_plugins_loaded)
-        self.worker.start()
-
-    def on_plugins_loaded(self, result):
-        found_plugins, not_found_plugins = result
-        self.plugin_list.clear()
-        for plugin in found_plugins:
-            item = QListWidgetItem(self.plugin_list)
-            widget = create_plugin_list_item(plugin)
-            item.setSizeHint(widget.sizeHint())
-            item.setData(Qt.UserRole, plugin)
-            self.plugin_list.setItemWidget(item, widget)
-
-        for plugin_name, plugin_version in not_found_plugins:
-            item = QListWidgetItem(self.plugin_list)
-            widget = create_not_found_plugin_list_item(plugin_name, plugin_version)
-            item.setSizeHint(widget.sizeHint())
-            self.plugin_list.setItemWidget(item, widget)
+        asyncio.run_coroutine_threadsafe(self.load_plugins(), asyncio.get_event_loop())
 
     async def load_plugins(self):
         try:
             found_plugins, not_found_plugins = await load_plugins()
-            return found_plugins, not_found_plugins
+            self.plugin_list.clear()
+            for plugin in found_plugins:
+                item = QListWidgetItem(self.plugin_list)
+                widget = create_plugin_list_item(plugin)
+                item.setSizeHint(widget.sizeHint())
+                item.setData(Qt.UserRole, plugin)
+                self.plugin_list.setItemWidget(item, widget)
+
+            for plugin_name, plugin_version in not_found_plugins:
+                item = QListWidgetItem(self.plugin_list)
+                widget = create_not_found_plugin_list_item(plugin_name, plugin_version)
+                item.setSizeHint(widget.sizeHint())
+                self.plugin_list.setItemWidget(item, widget)
         except Exception as e:
             logger.error(f"Error loading plugins: {e}")
-            return [], []
+
+    @asyncSlot()
+    async def check_updates(self):
+        try:
+            updates = await check_for_updates(state.found_plugins)
+            for plugin_name, current_version, latest_version, latest_version_date in updates:
+                item = QListWidgetItem(
+                    f"Update available for {plugin_name}: {current_version} -> {latest_version} ({prettify_date(latest_version_date)})")
+                self.plugin_list.addItem(item)
+        except Exception as e:
+            logger.error(f"Error checking updates: {e}")
 
     def display_plugin_info(self, item):
         plugin = item.data(Qt.UserRole)
@@ -596,27 +586,6 @@ class MainWindow(QMainWindow):
             info_widget.setLayout(info_layout)
 
             self.info_box.setWidget(info_widget)
-
-    def check_updates(self):
-        async def check():
-            try:
-                updates = await check_for_updates(state.found_plugins)
-                for plugin_name, current_version, latest_version, latest_version_date in updates:
-                    item = QListWidgetItem(
-                        f"Update available for {plugin_name}: {current_version} -> {latest_version} ({prettify_date(latest_version_date)})")
-                    self.plugin_list.addItem(item)
-            except Exception as e:
-                logger.error(f"Error checking updates: {e}")
-
-        self.worker = AsyncWorker(check())
-        self.worker.finished.connect(self.on_updates_checked)
-        self.worker.start()
-
-    def on_updates_checked(self, updates):
-        for plugin_name, current_version, latest_version, latest_version_date in updates:
-            item = QListWidgetItem(
-                f"Update available for {plugin_name}: {current_version} -> {latest_version} ({prettify_date(latest_version_date)})")
-            self.plugin_list.addItem(item)
 
     def remove_plugin(self):
         selected_items = self.plugin_list.selectedItems()
@@ -657,6 +626,7 @@ class SearchDialog(QMainWindow):
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
 
+    @asyncSlot()
     async def search(self):
         plugin_name = self.search_field.text()
         if plugin_name:
@@ -711,8 +681,13 @@ class PluginResultsDialog(QMainWindow):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    app = QAsyncApplication(sys.argv)
     qt_material.apply_stylesheet(app, theme='dark_lightgreen.xml')
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
     main_window = MainWindow()
     main_window.show()
-    sys.exit(app.exec())
+
+    with loop:
+        loop.run_forever()
