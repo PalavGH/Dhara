@@ -229,6 +229,9 @@ def get_best_match(plugin_name, results, source):
             normalized_result_name = normalize_name(plugin['title'])
         elif source == "hangar":
             normalized_result_name = normalize_name(plugin['name'])
+        else:
+            logger.error(f"Unknown source: {source}, PROBABLY ADDING CURSEFORGE OR SOMETHING AND FORGOT, LETS FIX THIS")
+            sys.exit(123)
 
         score = SequenceMatcher(None, normalized_plugin_name, normalized_result_name).ratio()
         if score > highest_score:
@@ -515,7 +518,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    qt_material.apply_stylesheet(app, theme='dark_teal.xml')
+    qt_material.apply_stylesheet(app, theme='dark_lightgreen.xml')
 
     window = MainWindow()
     window.show()
