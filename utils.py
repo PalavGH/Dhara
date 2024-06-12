@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sqlite3
 import json
 import traceback
 from datetime import datetime
@@ -10,14 +9,20 @@ from loguru import logger
 import httpx
 from httpx import HTTPStatusError
 from state import state  # Import state from state.py
+import redis
+import flatbuffers
+from PluginManager import Plugin
 
 # Load configuration
 with open('config.json', 'r') as config_file:
     config = json.load(config_file)
 
-# Load API keys from environment variables
-API_KEY_MODRINTH = os.environ.get(config['api_keys']['modrinth'])
-API_KEY_HANGAR = os.environ.get(config['api_keys']['hangar'])
+# Initialize Redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+# Load API keys from Redis
+API_KEY_MODRINTH = state.get_api_key('modrinth') or os.environ.get(config['api_keys']['modrinth'])
+API_KEY_HANGAR = state.get_api_key('hangar') or os.environ.get(config['api_keys']['hangar'])
 
 # Load other configurations
 SEARCH_URL_MODRINTH = config['urls']['search_modrinth']
@@ -25,16 +30,12 @@ AUTH_URL_HANGAR = config['urls']['auth_hangar']
 SEARCH_URL_HANGAR = config['urls']['search_hangar']
 CACHE_DIR = config['paths']['cache_dir']
 PLUGIN_FOLDER = config['paths']['plugin_folder']
-DB_PATH = config['paths']['db_path']
 USER_AGENT = config['user_agent']
-DB_SCHEMA = config['db_schema']['plugins']
 
 logger.add("plugin_manager.log", rotation="10 MB")
 
-
 def normalize_name(name):
     return ''.join(e for e in name if e.isalpha()).lower()
-
 
 @asynccontextmanager
 async def http_session():
@@ -44,62 +45,77 @@ async def http_session():
         finally:
             await session.aclose()
 
-
 def init_db():
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(f'''CREATE TABLE IF NOT EXISTS plugins (
-                      {", ".join([f"{key} {value}" for key, value in DB_SCHEMA.items()])}
-                      )''')
-    conn.commit()
-    conn.close()
 
+def serialize_plugin(plugin_data):
+    builder = flatbuffers.Builder(1024)
+
+    name = builder.CreateString(plugin_data['name'])
+    title = builder.CreateString(plugin_data['title'])
+    description = builder.CreateString(plugin_data['description'])
+    author = builder.CreateString(plugin_data['author'])
+    date_created = builder.CreateString(plugin_data['date_created'])
+    date_modified = builder.CreateString(plugin_data['date_modified'])
+    icon_url = builder.CreateString(plugin_data['icon_url'])
+    category = builder.CreateString(plugin_data['category'])
+    url = builder.CreateString(plugin_data['url'])
+    source = builder.CreateString(plugin_data['source'])
+
+    Plugin.PluginStart(builder)
+    Plugin.PluginAddName(builder, name)
+    Plugin.PluginAddTitle(builder, title)
+    Plugin.PluginAddDescription(builder, description)
+    Plugin.PluginAddAuthor(builder, author)
+    Plugin.PluginAddDateCreated(builder, date_created)
+    Plugin.PluginAddDateModified(builder, date_modified)
+    Plugin.PluginAddIconUrl(builder, icon_url)
+    Plugin.PluginAddCategory(builder, category)
+    Plugin.PluginAddDownloads(builder, plugin_data['downloads'])
+    Plugin.PluginAddFollows(builder, plugin_data['follows'])
+    Plugin.PluginAddUrl(builder, url)
+    Plugin.PluginAddSource(builder, source)
+    plugin = Plugin.PluginEnd(builder)
+    builder.Finish(plugin)
+
+    return bytes(builder.Output())
+
+def deserialize_plugin(data):
+    plugin = Plugin.Plugin.GetRootAsPlugin(data, 0)
+    return {
+        "name": plugin.Name().decode('utf-8'),
+        "title": plugin.Title().decode('utf-8'),
+        "description": plugin.Description().decode('utf-8'),
+        "author": plugin.Author().decode('utf-8'),
+        "date_created": plugin.DateCreated().decode('utf-8'),
+        "date_modified": plugin.DateModified().decode('utf-8'),
+        "icon_url": plugin.IconUrl().decode('utf-8'),
+        "category": plugin.Category().decode('utf-8'),
+        "downloads": plugin.Downloads(),
+        "follows": plugin.Follows(),
+        "url": plugin.Url().decode('utf-8'),
+        "source": plugin.Source().decode('utf-8')
+    }
 
 async def insert_or_update_plugin(plugin_data):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''INSERT OR REPLACE INTO plugins (name, title, description, author, date_created, date_modified, icon_url, category, downloads, follows, url, source)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                       (plugin_data['name'], plugin_data['title'], plugin_data['description'], plugin_data['author'],
-                        plugin_data['date_created'], plugin_data['date_modified'], plugin_data['icon_url'],
-                        plugin_data['category'], plugin_data['downloads'], plugin_data['follows'], plugin_data['url'],
-                        plugin_data['source']))
-        conn.commit()
-        conn.close()
+        key = f"plugin:{plugin_data['name']}"
+        serialized_data = serialize_plugin(plugin_data)
+        redis_client.set(key, serialized_data)
     except Exception as e:
         logger.error(f"Error inserting or updating plugin data: {e}")
 
-
 async def get_plugin_from_db(plugin_name):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM plugins WHERE name=?", (plugin_name,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return {
-                "name": row[1],
-                "title": row[2],
-                "description": row[3],
-                "author": row[4],
-                "date_created": row[5],
-                "date_modified": row[6],
-                "icon_url": row[7],
-                "category": row[8],
-                "downloads": row[9],
-                "follows": row[10],
-                "url": row[11],
-                "source": row[12]
-            }
+        key = f"plugin:{plugin_name}"
+        plugin_data = redis_client.get(key)
+        if plugin_data:
+            return deserialize_plugin(plugin_data)
         return None
     except Exception as e:
         logger.error(f"Error fetching plugin from database: {e}")
         return None
-
 
 async def fetch(url, session, headers=None, params=None):
     try:
@@ -121,7 +137,6 @@ async def fetch(url, session, headers=None, params=None):
         logger.error(traceback.format_exc())
         return None
 
-
 async def authenticate_hangar():
     try:
         async with http_session() as session:
@@ -137,12 +152,11 @@ async def authenticate_hangar():
         logger.error(f"Unexpected error during Hangar authentication: {e}")
         return None
 
-
 async def search_plugin(plugin_name, source="both"):
     async with http_session() as session:
         normalized_plugin_name = normalize_name(plugin_name)
 
-        # Check cache (SQLite) first
+        # Check cache (Redis) first
         cached_data = await get_plugin_from_db(normalized_plugin_name)
         if cached_data:
             logger.info(f"Found cached data for {plugin_name}")
@@ -185,7 +199,6 @@ async def search_plugin(plugin_name, source="both"):
 
     return [], None
 
-
 def convert_to_unified(data, source):
     if source == "modrinth":
         return {
@@ -218,7 +231,6 @@ def convert_to_unified(data, source):
             "source": source
         }
 
-
 def get_best_match(plugin_name, results):
     best_match = None
     highest_score = 0
@@ -233,11 +245,9 @@ def get_best_match(plugin_name, results):
 
     return best_match if highest_score > 0.8 else None
 
-
 def scan_folder(folder_path):
     return [(os.path.splitext(filename)[0], "Unknown Version") for filename in os.listdir(folder_path) if
             filename.endswith(".jar")]
-
 
 async def check_plugins(folder_path):
     plugins = scan_folder(folder_path)
@@ -273,7 +283,6 @@ async def check_plugins(folder_path):
 
     return state.found_plugins, state.not_found_plugins
 
-
 async def download_image(url, filepath):
     try:
         async with http_session() as session:
@@ -284,7 +293,6 @@ async def download_image(url, filepath):
                         f.write(chunk)
     except Exception as e:
         logger.error(f"Error downloading image: {e}")
-
 
 async def check_for_updates(found_plugins):
     updates = []
@@ -300,7 +308,6 @@ async def check_for_updates(found_plugins):
         logger.error(f"Error checking updates: {e}")
         return updates
 
-
 async def download_plugin(url, destination):
     try:
         async with http_session() as session:
@@ -312,14 +319,12 @@ async def download_plugin(url, destination):
     except Exception as e:
         logger.error(f"Error downloading plugin: {e}")
 
-
 def prettify_date(date_str):
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         return dt.strftime("%B %d, %Y")
     except ValueError:
         return date_str
-
 
 async def load_plugins():
     state.set_loading(True)

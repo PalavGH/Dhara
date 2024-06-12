@@ -1,0 +1,18 @@
+namespace PluginManager;
+
+table Plugin {
+  name: string;
+  title: string;
+  description: string;
+  author: string;
+  date_created: string;
+  date_modified: string;
+  icon_url: string;
+  category: string;
+  downloads: int;
+  follows: int;
+  url: string;
+  source: string;
+}
+
+root_type Plugin;
