@@ -58,9 +58,9 @@ class DharaPluginManager:
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(url, json={"plugin_name": plugin_name}) as response:
-                    if response.status == 200):
+                    if response.status == 200:
                         data = await response.json()
-                        await self.redis_cache.set(plugin_name, data, ex=300)  # Cache for 5 minutes
+                        await self.redis_cache.set(plugin_name, json.dumps(data), ex=300)  # Cache for 5 minutes
                         self.local_cache.save_json(f"{plugin_name}.json", data)
                         logger.info(f"Fetched {plugin_name} data from server and updated caches")
                         return data
