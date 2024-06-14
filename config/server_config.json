@@ -1,0 +1,13 @@
+{
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "db": 0
+  },
+  "urls": {
+    "auth_hangar": "http://example.com/auth/hangar",
+    "search_hangar": "http://example.com/search/hangar",
+    "search_modrinth": "http://example.com/search/modrinth"
+  },
+  "user_agent": "PluginManager/1.0"
+}

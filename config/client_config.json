@@ -1,0 +1,15 @@
+{
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "db": 0
+  },
+  "server": {
+    "host": "localhost",
+    "port": 8000
+  },
+  "paths": {
+    "cache_dir": "path/to/cache",
+    "plugin_folder": "path/to/plugins"
+  }
+}
