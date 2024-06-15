@@ -5,9 +5,10 @@
     "db": 0
   },
   "urls": {
-    "auth_hangar": "http://example.com/auth/hangar",
-    "search_hangar": "http://example.com/search/hangar",
-    "search_modrinth": "http://example.com/search/modrinth"
+    "search_modrinth": "https://api.modrinth.com/v2/search",
+    "project_modrinth": "https://api.modrinth.com/v2/project",
+    "auth_hangar": "https://hangar.papermc.io/api/v1/authenticate",
+    "search_hangar": "https://hangar.papermc.io/api/v1/projects"
   },
   "user_agent": "PluginManager/1.0"
 }

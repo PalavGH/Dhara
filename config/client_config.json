@@ -9,7 +9,7 @@
     "port": 8000
   },
   "paths": {
-    "cache_dir": "path/to/cache",
-    "plugin_folder": "path/to/plugins"
+    "cache_dir": "C:\\Custom\\ProgrammingProjects\\cache",
+    "plugin_folder": "C:\\Custom\\ProgrammingProjects\\plugins"
   }
 }

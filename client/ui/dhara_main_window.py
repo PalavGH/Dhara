@@ -1,12 +1,18 @@
+import base64
 import os
+import traceback
+import asyncio
+
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QPushButton, QListWidget, QListWidgetItem, QScrollArea, QLabel, QHBoxLayout, QWidget, QMessageBox
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt
+from loguru import logger
+
 from client.plugins.dhara_plugin_manager import DharaPluginManager
 from client.plugins.dhara_plugin_list import DharaPluginList
 from client.ui.dhara_worker import DharaWorker
 from client.ui.components.dhara_search_dialog import DharaSearchDialog
 from utils.dhara_helper import prettify_date
-from PyQt6.QtCore import Qt
 
 class DharaMainWindow(QMainWindow):
     def __init__(self, config):
@@ -55,42 +61,55 @@ class DharaMainWindow(QMainWindow):
     def start_loading_plugins(self):
         plugin_folder_path = self.config['paths']['plugin_folder']
         self.thread = DharaWorker(self.plugin_manager, plugin_folder_path)
+        self.thread.plugin_found.connect(self.add_plugin_to_list)
         self.thread.finished.connect(self.on_plugins_loaded)
+        logger.debug("Starting worker thread for loading plugins")
         self.thread.start()
 
-    def on_plugins_loaded(self, found_plugins, not_found_plugins):
-        self.plugin_list_widget.clear()
-        for plugin in found_plugins:
-            item = QListWidgetItem()
-            widget = self.create_plugin_list_item(plugin)
-            item.setSizeHint(widget.sizeHint())
-            item.setData(Qt.UserRole, plugin)
-            self.plugin_list_widget.addItem(item)
-            self.plugin_list_widget.setItemWidget(item, widget)
+    def add_plugin_to_list(self, plugin):
+        plugin_name, plugin_data = plugin
+        item = QListWidgetItem()
+        widget = self.create_plugin_list_item(plugin)
+        item.setSizeHint(widget.sizeHint())
+        item.setData(Qt.ItemDataRole.UserRole, plugin)
+        self.plugin_list_widget.addItem(item)
+        self.plugin_list_widget.setItemWidget(item, widget)
 
-        for plugin_name, plugin_version in not_found_plugins:
-            item = QListWidgetItem()
-            widget = self.create_not_found_plugin_list_item(plugin_name, plugin_version)
-            item.setSizeHint(widget.sizeHint())
-            self.plugin_list_widget.addItem(item)
-            self.plugin_list_widget.setItemWidget(item, widget)
+    def on_plugins_loaded(self, found_plugins, not_found_plugins):
+        logger.debug("Worker thread finished loading plugins")
+        try:
+            for plugin_name, plugin_version in not_found_plugins:
+                item = QListWidgetItem()
+                widget = self.create_not_found_plugin_list_item(plugin_name, plugin_version)
+                item.setSizeHint(widget.sizeHint())
+                self.plugin_list_widget.addItem(item)
+                self.plugin_list_widget.setItemWidget(item, widget)
+        except Exception as e:
+            logger.exception(f"Error loading plugins: {e}")
 
     def check_updates(self):
+        logger.debug("Checking for updates")
         # Implement the logic to check for updates
         pass
 
     def display_plugin_info(self, item):
-        plugin = item.data(Qt.UserRole)
+        plugin = item.data(Qt.ItemDataRole.UserRole)
         if plugin:
-            plugin_name, date_modified, title, url, plugin_data, image_filepath = plugin
+            logger.debug(f"Displaying info for plugin: {plugin}")
+            plugin_name, plugin_data = plugin
+            title = plugin_data.get('name', 'Unknown Title')
+            url = plugin_data.get('url', '#')
+            date_modified = plugin_data.get('last_updated', 'Unknown Date')
             author = plugin_data.get('author', 'Unknown Author')
             description = plugin_data.get('description', 'No description available.')
+            icon_data = plugin_data.get('icon_data', '')
 
             info_layout = QHBoxLayout()
 
             image_label = QLabel()
-            if image_filepath and os.path.exists(image_filepath):
-                pixmap = QPixmap(image_filepath)
+            if icon_data:
+                pixmap = QPixmap()
+                pixmap.loadFromData(base64.b64decode(icon_data))
                 image_label.setPixmap(pixmap)
                 image_label.setFixedSize(128, 128)
                 image_label.setScaledContents(True)
@@ -116,31 +135,36 @@ class DharaMainWindow(QMainWindow):
         selected_items = self.plugin_list_widget.selectedItems()
         if selected_items:
             item = selected_items[0]
-            plugin = item.data(Qt.UserRole)
+            plugin = item.data(Qt.ItemDataRole.UserRole)
             plugin_name = plugin[0]
 
             try:
                 os.remove(os.path.join(self.config['paths']['plugin_folder'], f"{plugin_name}.jar"))
                 self.plugin_list_widget.takeItem(self.plugin_list_widget.row(item))
+                logger.debug(f"Removed plugin {plugin_name}")
             except Exception as e:
+                logger.exception(f"Error removing plugin {plugin_name}: {e}")
                 self.show_error_message("Error", f"An error occurred while removing plugin '{plugin_name}'")
 
     def search_plugins(self):
+        logger.debug("Opening search dialog")
         search_dialog = DharaSearchDialog(self)
         search_dialog.exec()
 
     def create_plugin_list_item(self, plugin):
         widget = QWidget()
         layout = QHBoxLayout()
+        plugin_name, plugin_data = plugin
 
-        label_name = QLabel(f"<a href='{plugin[3]}' style='color: black'>{plugin[2]}</a>")
+        label_name = QLabel(f"<a href='{plugin_data['url']}' style='color: black'>{plugin_data['name']}</a>")
         label_name.setOpenExternalLinks(True)
-        label_last_updated = QLabel(f"Date Modified: {prettify_date(plugin[1])}")
+        label_last_updated = QLabel(f"Date Modified: {prettify_date(plugin_data['last_updated'])}")
 
         image_label = QLabel()
-        image_filepath = plugin[5]
-        if image_filepath and os.path.exists(image_filepath):
-            pixmap = QPixmap(image_filepath)
+        icon_data = plugin_data.get('icon_data', None)
+        if icon_data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(icon_data))
             image_label.setPixmap(pixmap)
             image_label.setFixedSize(64, 64)
             image_label.setScaledContents(True)
